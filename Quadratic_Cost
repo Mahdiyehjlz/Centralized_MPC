@@ -1,0 +1,592 @@
+clear;
+close all;
+clc;
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% ---------------------import libraries--------------------------%
+import casadi.*
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------Dynamics-------------------%%
+
+% this dynamic using SX is only to use in casadi and different from matlab
+% mathematic toolbox that we were using syms
+% this is easier and better
+N = 4;
+nx = 3*N;
+nu = 2*N;
+
+x = SX.sym('x', nx, 1);
+u = SX.sym('u', nu, 1);
+
+f_expl = SX.zeros(nx,1);
+for i = 1:N
+    xi = x(3*(i-1)+1);
+    yi = x(3*(i-1)+2);
+    thi = x(3*(i-1)+3);
+    vi = u(2*(i-1)+1);
+    wi = u(2*(i-1)+2);
+
+    f_expl(3*(i-1)+(1:3)) = [vi*cos(thi); vi*sin(thi); wi];
+end
+
+% CasADi function to evaluate dynamics (useful for simulation)
+f_fun = Function('f_fun', {x, u}, {f_expl});
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -----------------Desired Position---------------------------------%
+% --------------------------------------------------------------
+% Compute desired absolute positions of each robot
+%
+% Step 1: Define the desired formation in the body frame.
+%         Each row = [x_rel, y_rel] relative to the formation center.
+% Step 2: Rotate by theta_des to orient the formation in the world frame.
+% Step 3: Shift by center_des so the formation center is located at (5,5).
+%
+% Formula:  p_i_abs = R(theta_des) * p_i_rel + center_des
+% --------------------------------------------------------------
+
+
+% Desired position for each robot: considering they create a square shape
+p_des_rel = [1, 1; 
+             1,-1;
+             -1,1;
+             -1,-1];   % each row = (x_rel, y_rel)
+
+% Desired orientation and Center
+theta_des = 0;    % formation rotated 45 degrees
+center_des = [0; 0]; % formation centered at (5,5) in world frame
+
+
+% rotate and translate reletive positions (robot kinematics)
+
+R = [cos(theta_des), -sin(theta_des);
+     sin(theta_des),  cos(theta_des)];
+
+% 2D rotation matrix 
+p_des_abs = zeros(N,2);
+for i = 1:N
+    p_des_abs(i,:) = (R * p_des_rel(i,:)')' + center_des';
+end
+
+
+%Build the desired state vector
+z_des = zeros(nx,1);
+for i = 1:N
+    idx = (i-1)*3 + (1:3);
+    z_des(idx(1)) = p_des_abs(i,1);  % desired x_i
+    z_des(idx(2)) = p_des_abs(i,2);  % desired y_i
+    z_des(idx(3)) = theta_des;       % all robots share the same heading
+end
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% ------------------MPC Parameters------------------------------%%
+
+Tf = 8;             % total simulation time [s]
+N_horizon = 60;      % prediction horizon steps
+dt = Tf / N_horizon; % sampling time
+
+% Input limits (not enforced here, but values kept)
+v_max = 2.0; w_max = 1.0;
+v_min = -v_max; w_min = -w_max;
+
+% initial state
+z0 = zeros(nx,1);
+% z0(3:3:end) = rand(N,1) * 2*pi;  % random orientations
+% here added
+% Calculate the square boundaries with some margin
+square_center = center_des;
+square_half_width = max(abs(p_des_rel(:,1))) + 2.0; % Add 2.0m margin
+square_half_height = max(abs(p_des_rel(:,2))) + 2.0; % Add 2.0m margin
+
+% Define regions outside the square (four quadrants around the square)
+outside_regions = [
+    square_center(1) + square_half_width + 1.0, square_center(2) + square_half_height + 1.0;  % Top-right
+    square_center(1) + square_half_width + 1.0, square_center(2) - square_half_height - 1.0;  % Bottom-right
+    square_center(1) - square_half_width - 1.0, square_center(2) - square_half_height - 1.0;  % Bottom-left
+    square_center(1) - square_half_width - 1.0, square_center(2) + square_half_height + 1.0   % Top-left
+];
+
+% Set initial positions far from the desired formation
+for i = 1:N
+    % Assign each robot to a different outside region
+    region_idx = i;
+    
+    % Add some random variation within the outside region
+    x_variation = (rand(1) - 0.5) * 2.0; % ±1m variation
+    y_variation = (rand(1) - 0.5) * 2.0; % ±1m variation
+    
+    z0(3*(i-1)+1) = outside_regions(region_idx, 1) + x_variation;  % x position
+    z0(3*(i-1)+2) = outside_regions(region_idx, 2) + y_variation;  % y position
+    z0(3*(i-1)+3) = rand(1) * 2*pi;  % random orientation
+end
+
+%until here
+
+% weights (quadratic weights)
+Q_x = 49.0; Q_y = 49.0; Q_th = 0.1;
+R_v = 2.25; R_w = 81;
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------------pack casadi symbols----------------------------%
+% Create acados model struct compatible with AcadosOcp
+model = AcadosModel();
+model.x = x;
+model.u = u;
+model.f_expl_expr = f_expl;
+model.name = 'multi_unicycle';
+
+%% --------------------Build Ocp--------------------------------------%%
+
+% here we create OCP container to specify model, Cost , Constraint
+% We already created the model, just attatched here
+
+ocp = AcadosOcp();
+ocp.model = model;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% ------------------ Cost Function ---------------------------------%%
+
+% Build weight matrices for each robot
+Wx_robot = diag([Q_x, Q_y, Q_th]);  % [3x3] per robot
+Wu_robot = diag([R_v, R_w]);        % [2x2] per robot
+
+% Create block diagonal matrices for all robots
+Wx = kron(eye(N), Wx_robot);  % [12x12] for 4 robots
+Wu = kron(eye(N), Wu_robot);  % [8x8] for 4 robots
+
+% 1. Initial Cost - only penalize control inputs (following pendulum example)
+ocp.cost.cost_type_0 = 'NONLINEAR_LS';
+ocp.cost.W_0 = Wu;                  % [8x8] input weights only
+ocp.cost.yref_0 = zeros(nu, 1);     % [8x1] zero reference for controls
+ocp.model.cost_y_expr_0 = model.u;  % Only controls in initial cost
+
+% 2. Path Cost - penalize both states and controls
+ocp.cost.cost_type = 'NONLINEAR_LS';
+ocp.cost.W = blkdiag(Wx, Wu);       % [20x20] combined weights
+ocp.cost.yref = [z_des; zeros(nu,1)];  % [20x1] desired states + zero controls
+ocp.model.cost_y_expr = vertcat(model.x, model.u);  % [20x1] outputs
+
+% 3. Terminal Cost - only penalize states
+ocp.cost.cost_type_e = 'NONLINEAR_LS';
+ocp.model.cost_y_expr_e = model.x;  % [12x1] only states
+ocp.cost.yref_e = z_des;            % [12x1] desired terminal states
+ocp.cost.W_e = Wx;                  % [12x12] state weights only
+
+
+%% ------------------ Horizon and Discretization ---------------------%%
+
+ocp.solver_options.tf = Tf;
+ocp.solver_options.N_horizon = N_horizon;
+
+
+%% Constraints
+% set initial state constraint
+ocp.constraints.x0 = z0;
+
+% Add input constraints (for stability)
+ocp.constraints.lbu = repmat([v_min; w_min], N, 1);
+ocp.constraints.ubu = repmat([v_max; w_max], N, 1);
+ocp.constraints.idxbu = 0:(nu-1);  % ZERO-BASED indices (0 to 7 for nu=8)
+
+
+
+%% Improved Solver options 
+
+ocp.solver_options.nlp_solver_type = 'SQP_RTI'; % Faster than SQP
+ocp.solver_options.integrator_type = 'ERK'; 
+ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'; 
+ocp.solver_options.qp_solver_iter_max = 100; 
+ocp.solver_options.qp_solver_tol_stat = 1e-6;  % Add tolerance
+ocp.solver_options.qp_solver_tol_eq = 1e-6;
+ocp.solver_options.qp_solver_tol_ineq = 1e-6;
+ocp.solver_options.qp_solver_tol_comp = 1e-6;
+ocp.solver_options.qp_solver_mu0 = 1e-2; % Reduced from 1e3
+ocp.solver_options.qp_solver_cond_N = N_horizon; % Use full horizon
+ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'; 
+ocp.solver_options.ext_fun_compile_flags = '-O2'; 
+ocp.solver_options.nlp_solver_max_iter = 50; % Reduced iterations
+ocp.solver_options.nlp_solver_tol_stat = 1e-4; % Add tolerances
+ocp.solver_options.nlp_solver_tol_eq = 1e-4;
+ocp.solver_options.nlp_solver_tol_ineq = 1e-4;
+ocp.solver_options.nlp_solver_tol_comp = 1e-4;
+ocp.solver_options.globalization = 'FIXED_STEP'; % Simpler than merit backtracking
+ocp.solver_options.levenberg_marquardt = 1e-2; % Regularization
+
+ocp.simulink_opts = []; 
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------------Create Acados Solver-------------------------%%
+
+% Create the acados ocp solver
+acados_ocp_solver = AcadosOcpSolver(ocp);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------------Simulation Setup-----------------------------%%
+
+% Number of simulation steps
+N_sim = 100;
+t_sim = linspace(0, Tf, N_sim+1);
+
+% Initialize simulation arrays
+z_sim = zeros(nx, N_sim+1);
+u_sim = zeros(nu, N_sim);
+z_sim(:,1) = z0;
+
+% Initialize cost function storage
+cost_values = zeros(1, N_sim);           % Total cost at each step
+state_cost_values = zeros(1, N_sim);     % State cost component
+control_cost_values = zeros(1, N_sim);   % Control cost component
+solver_status = zeros(1, N_sim);         % Solver status
+solver_iterations = zeros(1, N_sim);     % Solver iterations
+solver_times = zeros(1, N_sim);          % Solver computation times
+
+% Create quadratic cost function for evaluation
+stage_cost_fn = @(x, u) (x - z_des)' * Wx * (x - z_des) + u' * Wu * u;
+
+% Initialize solver
+acados_ocp_solver.set('constr_x0', z0);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------------Main Simulation Loop-------------------------%%
+
+fprintf('Starting MPC simulation...\n');
+
+for k = 1:N_sim
+
+    % Set initial state for current optimization
+    acados_ocp_solver.set('constr_x0', z_sim(:,k));
+    
+    % Solve OCP
+    acados_ocp_solver.solve();
+    
+    % Get solver statistics
+    status = acados_ocp_solver.get('status');
+    sqp_iter = acados_ocp_solver.get('sqp_iter');
+    time_tot = acados_ocp_solver.get('time_tot');
+    
+    solver_status(k) = status;
+    solver_iterations(k) = sqp_iter;
+    solver_times(k) = time_tot;
+    
+    if status ~= 0
+        fprintf('Warning: acados returned status %d at step %d\n', status, k);
+        fprintf('  SQP iterations: %d, Solve time: %.4f ms\n', sqp_iter, time_tot*1000);
+    end
+    
+    % Get optimal control input (first step)
+    u_opt = acados_ocp_solver.get('u', 0);
+    u_sim(:,k) = u_opt;
+    
+    % Calculate quadratic cost for current state and applied control
+    current_total_cost = stage_cost_fn(z_sim(:,k), u_opt);
+    cost_values(k) = current_total_cost;
+    
+    % Calculate state cost component
+    state_cost_val = (z_sim(:,k) - z_des)' * Wx * (z_sim(:,k) - z_des);
+    state_cost_values(k) = state_cost_val;
+    
+    % Calculate control cost component
+    control_cost_val = u_opt' * Wu * u_opt;
+    control_cost_values(k) = control_cost_val;
+    
+    % Simulate system forward (using 4th order Runge-Kutta)
+    z_current = z_sim(:,k);
+    
+    % RK4 integration
+    k1 = f_fun(z_current, u_opt);
+    k2 = f_fun(z_current + 0.5*dt*k1, u_opt);
+    k3 = f_fun(z_current + 0.5*dt*k2, u_opt);
+    k4 = f_fun(z_current + dt*k3, u_opt);
+    
+    z_next = z_current + (dt/6) * (k1 + 2*k2 + 2*k3 + k4);
+    z_sim(:,k+1) = full(z_next);
+    
+    % Print progress with cost information
+    if mod(k, 10) == 0
+        fprintf('Step %d/%d - Cost: %.4f (State: %.4f, Control: %.4f)\n', ...
+                k, N_sim, cost_values(k), state_cost_values(k), control_cost_values(k));
+    end
+end
+
+fprintf('Simulation completed successfully!\n');
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------------Cost Function Analysis Plots-----------------%%
+
+fprintf('\n=== Cost Function Analysis ===\n');
+fprintf('Initial Cost: %.4f\n', cost_values(1));
+fprintf('Final Cost: %.4f\n', cost_values(end));
+fprintf('Cost Reduction: %.2f%%\n', (cost_values(1)-cost_values(end))/cost_values(1)*100);
+
+% Create comprehensive cost analysis figure
+figure('Position', [100, 100, 1400, 900]);
+
+% 1. Total cost over time
+subplot(2,3,1);
+hold on; grid on;
+plot(t_sim(1:end-1), cost_values, 'b-', 'LineWidth', 2);
+xlabel('Time [s]');
+ylabel('Cost Value');
+title('Total Cost Function Over Time');
+set(gca, 'YScale', 'log');
+
+% 2. Cost decomposition
+subplot(2,3,2);
+hold on; grid on;
+plot(t_sim(1:end-1), cost_values, 'k-', 'LineWidth', 3);
+plot(t_sim(1:end-1), state_cost_values, 'r-', 'LineWidth', 2);
+plot(t_sim(1:end-1), control_cost_values, 'b-', 'LineWidth', 2);
+xlabel('Time [s]');
+ylabel('Cost Value');
+title('Cost Function Decomposition');
+legend('Total Cost', 'State Cost', 'Control Cost', 'Location', 'best');
+set(gca, 'YScale', 'log');
+
+% 3. Cost reduction percentage
+subplot(2,3,3);
+cost_reduction = (cost_values(1) - cost_values) / cost_values(1) * 100;
+plot(t_sim(1:end-1), cost_reduction, 'g-', 'LineWidth', 2);
+grid on;
+xlabel('Time [s]');
+ylabel('Cost Reduction (%)');
+title('Cost Reduction Progress');
+yline(90, 'r--', '90% Reduction', 'LineWidth', 1);
+yline(95, 'm--', '95% Reduction', 'LineWidth', 1);
+
+% 4. Cumulative cost
+subplot(2,3,4);
+cumulative_cost = cumsum(cost_values);
+plot(t_sim(1:end-1), cumulative_cost, 'm-', 'LineWidth', 2);
+grid on;
+xlabel('Time [s]');
+ylabel('Cumulative Cost');
+title('Cumulative Cost Over Time');
+
+% 5. Cost components ratio
+subplot(2,3,5);
+control_ratio = control_cost_values ./ cost_values * 100;
+state_ratio = state_cost_values ./ cost_values * 100;
+plot(t_sim(1:end-1), state_ratio, 'r-', 'LineWidth', 2);
+hold on; grid on;
+plot(t_sim(1:end-1), control_ratio, 'b-', 'LineWidth', 2);
+xlabel('Time [s]');
+ylabel('Percentage (%)');
+title('Cost Components Ratio');
+legend('State Cost %', 'Control Cost %', 'Location', 'best');
+ylim([0, 100]);
+
+% 6. Solver performance
+subplot(2,3,6);
+yyaxis left
+plot(t_sim(1:end-1), solver_iterations, 'b-', 'LineWidth', 2);
+ylabel('SQP Iterations');
+yyaxis right
+plot(t_sim(1:end-1), solver_times*1000, 'r-', 'LineWidth', 2);
+ylabel('Solve Time [ms]');
+xlabel('Time [s]');
+title('Solver Performance');
+grid on;
+
+sgtitle('MPC Cost Function Performance Analysis (Quadratic Cost)');
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------------Plotting Results-----------------------------%%
+
+figure('Position', [100, 100, 1200, 800]);
+
+% 1. Trajectories in 2D space
+subplot(2,3,1);
+hold on; grid on;
+colors = ['r', 'g', 'b', 'm'];
+for i = 1:N
+    idx = (i-1)*3 + (1:2);
+    plot(z_sim(idx(1),:), z_sim(idx(2),:), [colors(i) '-'], 'LineWidth', 1.5);
+    plot(z_sim(idx(1),1), z_sim(idx(2),1), [colors(i) 'o'], 'MarkerSize', 8, 'LineWidth', 2);
+    plot(z_des(idx(1)), z_des(idx(2)), [colors(i) 's'], 'MarkerSize', 10, 'LineWidth', 2);
+end
+xlabel('X position'); ylabel('Y position');
+title('Robot Trajectories');
+legend('Robot 1', 'Start 1', 'Goal 1', ...
+       'Robot 2', 'Start 2', 'Goal 2', ...
+       'Robot 3', 'Start 3', 'Goal 3', ...
+       'Robot 4', 'Start 4', 'Goal 4');
+axis equal;
+
+% 2. Position errors over time
+subplot(2,3,2);
+hold on; grid on;
+pos_errors = zeros(N, N_sim+1);
+for i = 1:N
+    idx = (i-1)*3 + (1:2);
+    for kk = 1:N_sim+1
+        pos_errors(i,kk) = norm(z_sim(idx,kk) - z_des(idx));
+    end
+    plot(t_sim, pos_errors(i,:), [colors(i) '-'], 'LineWidth', 1.5);
+end
+xlabel('Time [s]'); ylabel('Position Error');
+title('Position Errors vs Time');
+legend('Robot 1', 'Robot 2', 'Robot 3', 'Robot 4');
+
+% 3. Linear velocities
+subplot(2,3,3);
+hold on; grid on;
+for i = 1:N
+    v_data = u_sim(2*(i-1)+1, :);
+    plot(t_sim(1:end-1), v_data, [colors(i) '-'], 'LineWidth', 1.5);
+end
+xlabel('Time [s]'); ylabel('Linear Velocity v');
+title('Control Inputs: Linear Velocities');
+legend('Robot 1', 'Robot 2', 'Robot 3', 'Robot 4');
+ylim([v_min-0.1, v_max+0.1]);
+
+% 4. Angular velocities
+subplot(2,3,4);
+hold on; grid on;
+for i = 1:N
+    w_data = u_sim(2*(i-1)+2, :);
+    plot(t_sim(1:end-1), w_data, [colors(i) '-'], 'LineWidth', 1.5);
+end
+xlabel('Time [s]'); ylabel('Angular Velocity w');
+title('Control Inputs: Angular Velocities');
+legend('Robot 1', 'Robot 2', 'Robot 3', 'Robot 4');
+ylim([w_min-0.1, w_max+0.1]);
+
+% 5. Headings over time
+subplot(2,3,5);
+hold on; grid on;
+for i = 1:N
+    theta_data = z_sim(3*i, :);
+    plot(t_sim, theta_data, [colors(i) '-'], 'LineWidth', 1.5);
+end
+plot([t_sim(1), t_sim(end)], [theta_des, theta_des], 'k--', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('Heading [rad]');
+title('Robot Headings vs Time');
+legend('Robot 1', 'Robot 2', 'Robot 3', 'Robot 4', 'Desired');
+
+% 6. Final formation visualization
+subplot(2,3,6);
+hold on; grid on;
+for i = 1:N
+    idx = (i-1)*3 + (1:2);
+    % Final positions
+    plot(z_sim(idx(1),end), z_sim(idx(2),end), [colors(i) 'o'], 'MarkerSize', 10, 'LineWidth', 3);
+    % Desired positions
+    plot(z_des(idx(1)), z_des(idx(2)), [colors(i) 'x'], 'MarkerSize', 12, 'LineWidth', 3);
+    
+    % Draw robot orientation
+    theta = z_sim(3*i, end);
+    dx = 0.2 * cos(theta);
+    dy = 0.2 * sin(theta);
+    quiver(z_sim(idx(1),end), z_sim(idx(2),end), dx, dy, ...
+           'Color', colors(i), 'LineWidth', 2, 'MaxHeadSize', 1);
+end
+xlabel('X position'); ylabel('Y position');
+title('Final Formation vs Desired');
+legend('Final Pos 1', 'Desired 1', 'Final Pos 2', 'Desired 2', ...
+       'Final Pos 3', 'Desired 3', 'Final Pos 4', 'Desired 4');
+axis equal;
+
+sgtitle('Multi-Robot MPC Formation Control Results (Quadratic Cost)');
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------------Performance Metrics--------------------------%%
+
+fprintf('\n=== Performance Metrics ===\n');
+fprintf('Final Position Errors:\n');
+for i = 1:N
+    idx = (i-1)*3 + (1:2);
+    final_error = norm(z_sim(idx,end) - z_des(idx));
+    fprintf('  Robot %d: %.4f m\n', i, final_error);
+end
+
+fprintf('\nControl Effort (RMS):\n');
+for i = 1:N
+    v_rms = sqrt(mean(u_sim(2*(i-1)+1,:).^2));
+    w_rms = sqrt(mean(u_sim(2*(i-1)+2,:).^2));
+    fprintf('  Robot %d: v_rms = %.4f, w_rms = %.4f\n', i, v_rms, w_rms);
+end
+
+% Enhanced performance metrics with cost analysis
+fprintf('\n=== Cost Performance Analysis ===\n');
+fprintf('Cost Function Performance:\n');
+fprintf('  Initial Cost: %.4f\n', cost_values(1));
+fprintf('  Final Cost: %.4f\n', cost_values(end));
+fprintf('  Total Cost Reduction: %.2f%%\n', (cost_values(1)-cost_values(end))/cost_values(1)*100);
+fprintf('  Average Cost per Step: %.4f\n', mean(cost_values));
+fprintf('  Final State Cost: %.4f\n', state_cost_values(end));
+fprintf('  Final Control Cost: %.4f\n', control_cost_values(end));
+fprintf('  State/Control Ratio: %.2f/%.2f\n', state_cost_values(end)/cost_values(end)*100, ...
+        control_cost_values(end)/cost_values(end)*100);
+
+fprintf('\n=== Solver Performance ===\n');
+fprintf('  Average SQP Iterations: %.2f\n', mean(solver_iterations));
+fprintf('  Maximum SQP Iterations: %d\n', max(solver_iterations));
+fprintf('  Average Solve Time: %.2f ms\n', mean(solver_times)*1000);
+fprintf('  Maximum Solve Time: %.2f ms\n', max(solver_times)*1000);
+fprintf('  Success Rate: %.1f%%\n', sum(solver_status==0)/N_sim*100);
+
+% Check if formation is achieved
+formation_tolerance = 0.1;
+max_final_error = max(pos_errors(:,end));
+if max_final_error < formation_tolerance
+    fprintf('\n✓ Formation control SUCCESSFUL (max error = %.4f < %.4f)\n', ...
+            max_final_error, formation_tolerance);
+else
+    fprintf('\n⚠ Formation control PARTIAL (max error = %.4f >= %.4f)\n', ...
+            max_final_error, formation_tolerance);
+end
+
+fprintf('\nSimulation and cost analysis completed successfully!\n');
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% -------------------Animation-------------------------%%
+
+fprintf('Creating animation...\n');
+figure('Position', [200, 200, 800, 800]);
+hold on; grid on;
+
+% Plot desired formation
+for i = 1:N
+    idx = (i-1)*3 + (1:2);
+    plot(z_des(idx(1)), z_des(idx(2)), 'ks', 'MarkerSize', 15, 'LineWidth', 2);
+end
+
+h_robots = gobjects(N,1);
+h_trails = gobjects(N,1);
+
+% Initialize plots
+for i = 1:N
+    idx = (i-1)*3 + (1:2);
+    h_trails(i) = plot(z_sim(idx(1),1), z_sim(idx(2),1), [colors(i) '-'], ...
+                      'LineWidth', 1, 'HandleVisibility', 'off');
+    h_robots(i) = plot(z_sim(idx(1),1), z_sim(idx(2),1), [colors(i) 'o'], ...
+                      'MarkerSize', 10, 'LineWidth', 3);
+end
+
+xlabel('X'); ylabel('Y');
+title('Multi-Robot Formation Control Animation (Quadratic Cost)');
+axis equal;
+xlim([min(z_sim(1:3:end,:),[],'all')-1, max(z_sim(1:3:end,:),[],'all')+1]);
+ylim([min(z_sim(2:3:end,:),[],'all')-1, max(z_sim(2:3:end,:),[],'all')+1]);
+legend('Desired Formation', 'Location', 'best');
+
+% Animation loop
+for k = 1:5:N_sim+1  % Show every 5th frame for speed
+    for i = 1:N
+        idx = (i-1)*3 + (1:2);
+        set(h_robots(i), 'XData', z_sim(idx(1),k), 'YData', z_sim(idx(2),k));
+        set(h_trails(i), 'XData', z_sim(idx(1),1:k), 'YData', z_sim(idx(2),1:k));
+    end
+    drawnow;
+    pause(0.05);
+end
+fprintf('Animation completed.\n');
+
+fprintf('\nSimulation and plotting completed successfully!\n');
